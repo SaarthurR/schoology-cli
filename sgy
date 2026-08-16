@@ -38,6 +38,7 @@ import sys
 import time
 import urllib.request
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -298,12 +299,20 @@ def page_text(path, page=None):
 
 def graded_only(items, key, show_all):
     """Keep the real classes, in period order. If a district doesn't use period
-    markers nothing would match, so fall back to returning everything."""
+    markers nothing would match, so fall back to returning everything.
+
+    Anything hidden is REPORTED, never dropped silently -- a class whose section
+    gets renamed would otherwise vanish from your grades with no sign."""
     if show_all:
         return items
     picked = [i for i in items if period_of(key(i)) is not None]
     if not picked:
+        print("(no period markers found — showing everything)\n")
         return items
+    hidden = len(items) - len(picked)
+    if hidden:
+        print(f"(showing {len(picked)} classes; {hidden} other enrolment(s) "
+              f"hidden — `--all` to see them)\n")
     return sorted(picked, key=lambda i: period_of(key(i)))
 
 
@@ -319,7 +328,17 @@ def cmd_classes(show_all):
 
 def cmd_grades(verbose, show_all):
     any_grade = False
-    for g in graded_only(load()["grades"], lambda c: c["course"], show_all):
+    data = load()
+    # A dash means "not posted". So does a broken parse, which is why an empty
+    # or row-less result is an error rather than a quiet page of dashes.
+    if not data["grades"]:
+        sys.exit("Couldn't read the gradebook — Schoology's page layout has "
+                 "probably changed. Don't trust any grade output until this is "
+                 "fixed; check the site directly.")
+    if data["grades"] and not any(g["rows"] for g in data["grades"]):
+        sys.exit("Found your classes but no grade rows — the gradebook layout "
+                 "has probably changed. Check the site directly.")
+    for g in graded_only(data["grades"], lambda c: c["course"], show_all):
         rows = g["rows"]
         overall = next((r["grade"] for r in rows if r["kind"] == "course"), "—")
         if overall not in ("—", ""):
@@ -340,15 +359,34 @@ def cmd_grades(verbose, show_all):
         print("\n(no grades posted yet)")
 
 
+def due_at(e):
+    """Schoology sends the hour in `start` and the minutes in a separate
+    `minute_adjustment`, which has to be SUBTRACTED. An 11:59pm deadline
+    arrives as start 23:00 with adjustment -59; reading `start` alone reports
+    it an hour early."""
+    s = e.get("start") or ""
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return s[:16] or "(no date)"
+    adj = e.get("minute_adjustment")
+    if adj:
+        dt -= timedelta(minutes=int(adj))
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
 def cmd_due(days):
     events = sorted(load(days)["cal"], key=lambda e: e.get("start", ""))
     if not events:
         print(f"Nothing due in the next {days} days.")
+        print(f"(only looked {days} days ahead — try `sgy due 60`)")
         return
     for e in events:
-        print(f"{(e.get('start') or '')[:16]}  "
+        print(f"{due_at(e)}  "
               f"{strip_tags(e.get('titleText'))[:52]:<52} "
               f"{e.get('content_title', '')[:30]}")
+    print(f"\n{len(events)} item(s) in the next {days} days. "
+          f"Anything later is not shown.")
 
 
 def show(path, page=None):
