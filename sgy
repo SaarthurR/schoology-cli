@@ -18,6 +18,14 @@ account.
     sgy json                   raw data, for piping into other tools
     sgy login                  re-run when the session expires
 
+Anything else you can see in a browser:
+
+    sgy messages               your inbox
+    sgy feed                   the home feed / recent updates
+    sgy info                   your profile
+    sgy materials [class]      a course's materials; no arg lists your classes
+    sgy page <path>            ANY Schoology page, as readable text
+
 Add --all to classes or grades to include non-graded enrolments (school hubs,
 counseling, advisory and the like).
 """
@@ -25,11 +33,11 @@ import html
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -78,6 +86,30 @@ async ({uid, start, end}) => {
     (await get(`/calendar/${uid}/${ym}?ajax=1&start=${start}&end=${end}`)).text);
 
   return {courses: courses.data.courses, grades, cal};
+}
+"""
+
+# Reads any page as text. No per-screen selectors, so nothing to break when
+# Schoology reshuffles a template.
+READ_JS = """
+async (path) => {
+  const r = await fetch(path, {credentials: 'include',
+                               headers: {'X-Requested-With': 'XMLHttpRequest'}});
+  const body = await r.text();
+  const ct = r.headers.get('content-type') || '';
+  if (ct.includes('json')) return {status: r.status, json: true, text: body};
+
+  const doc = new DOMParser().parseFromString(body, 'text/html');
+  doc.querySelectorAll(
+    'script,style,noscript,nav,header,footer,.visually-hidden,' +
+    '#header,#footer,#left-nav,.sidebar').forEach(e => e.remove());
+  const main = doc.querySelector('#main-inner,#center-top,#content,#main,body');
+  const text = (main ? main.innerText || main.textContent : '')
+    .replace(/[ \\t]+/g, ' ')
+    .replace(/ *\\n */g, '\\n')
+    .replace(/\\n{3,}/g, '\\n\\n')
+    .trim();
+  return {status: r.status, json: false, text};
 }
 """
 
@@ -223,7 +255,9 @@ def login():
 
 # ---------------------------------------------------------------- fetching
 
-def load(days=30):
+@contextmanager
+def session():
+    """A logged-in page on the Schoology home screen, plus your user id."""
     if not CONFIG.exists():
         sys.exit("Not set up yet. Run:  sgy setup")
     if not STATE.exists():
@@ -239,13 +273,27 @@ def load(days=30):
             m = re.search(r'["\']uid["\']\s*:\s*["\']?(\d{6,})', page.content())
             if not m:
                 sys.exit("Session expired. Run:  sgy login")
-            now = int(time.time())
-            return page.evaluate(FETCH_JS, {"uid": m.group(1),
-                                            "start": now,
-                                            "end": now + days * 86400})
+            yield page, m.group(1)
         finally:
             ctx.close()
             browser.close()
+
+
+def load(days=30):
+    with session() as (page, uid):
+        now = int(time.time())
+        return page.evaluate(FETCH_JS, {"uid": uid, "start": now,
+                                        "end": now + days * 86400})
+
+
+def page_text(path, page=None):
+    """Any Schoology page as readable text. Deliberately generic: Schoology
+    server-renders most of itself, and bespoke selectors for each screen would
+    be guesswork that rots. This reads whatever the page actually says."""
+    if page is None:
+        with session() as (p, _):
+            return page_text(path, p)
+    return page.evaluate(READ_JS, path)
 
 
 def graded_only(items, key, show_all):
@@ -303,9 +351,43 @@ def cmd_due(days):
               f"{e.get('content_title', '')[:30]}")
 
 
+def show(path, page=None):
+    r = page_text(path, page)
+    if r["status"] >= 400:
+        sys.exit(f"Schoology returned {r['status']} for {path}")
+    if r["json"]:
+        print(json.dumps(json.loads(r["text"]), indent=2))
+    else:
+        print(r["text"] or "(page is empty)")
+
+
+def cmd_materials(query):
+    """Resolve a class by period number or name, then print its materials."""
+    with session() as (page, uid):
+        now = int(time.time())
+        courses = page.evaluate(FETCH_JS, {"uid": uid, "start": now,
+                                           "end": now})["courses"]
+        if not query:
+            print("Which class? Pass a period number or part of the name:\n")
+            for c in courses:
+                p = period_of(c["sectionTitle"])
+                print(f"  {('p%d' % p) if p else '  ':<4} {c['courseTitle']}")
+            return
+        q = query.lower()
+        hits = [c for c in courses
+                if q in c["courseTitle"].lower()
+                or (q.isdigit() and period_of(c["sectionTitle"]) == int(q))]
+        if not hits:
+            sys.exit(f"No class matching {query!r}. Run `sgy materials` to list them.")
+        for c in hits:
+            print(f"=== {c['courseTitle']} ===")
+            show(f"/course/{c['nid']}/materials", page)
+
+
 def main(argv):
     cmd = argv[0] if argv else "grades"
     show_all = "--all" in argv
+    rest = [a for a in argv[1:] if not a.startswith("-")]
     if cmd == "setup":
         return setup(argv[1:])
     if cmd == "login":
@@ -319,6 +401,19 @@ def main(argv):
         cmd_due(int(nums[0]) if nums else 14)
     elif cmd == "json":
         print(json.dumps(load(), indent=2))
+    elif cmd == "messages":
+        show("/messages")
+    elif cmd == "feed":
+        show("/home")
+    elif cmd == "info":
+        with session() as (page, uid):
+            show(f"/user/{uid}/info", page)
+    elif cmd == "materials":
+        cmd_materials(rest[0] if rest else None)
+    elif cmd == "page":
+        if not rest:
+            sys.exit("Which page? e.g.  sgy page /messages/sent")
+        show(rest[0] if rest[0].startswith("/") else "/" + rest[0])
     else:
         sys.exit(__doc__)
     return 0

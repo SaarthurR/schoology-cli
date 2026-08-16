@@ -58,11 +58,34 @@ You can skip the prompt by passing the address:
 | `sgy grades` | One line per class |
 | `sgy grades -v` | Plus category weights and assignments |
 | `sgy due [days]` | What's due; defaults to 14 |
-| `sgy json` | Everything, unfiltered — pipe it into `jq` |
+| `sgy json` | Structured data — pipe it into `jq` |
 | `sgy login` | Re-run when your session expires |
+
+Everything else you can see in a browser:
+
+| Command | What it does |
+|---|---|
+| `sgy messages` | Your inbox |
+| `sgy feed` | Home feed / recent updates |
+| `sgy info` | Your profile |
+| `sgy materials [class]` | A course's materials; no argument lists your classes |
+| `sgy page <path>` | **Any** Schoology page, as readable text |
+
+`sgy page` is the escape hatch. Anything in Schoology that has a URL, it will
+print — `sgy page /messages/sent`, `sgy page /assignment/7422452694`. JSON
+endpoints come back as JSON; everything else is rendered to plain text.
 
 Add `--all` to `classes` or `grades` to include non-graded enrolments — school
 hubs, counseling pages, advisory, onboarding courses.
+
+### Why `page` isn't a pile of parsers
+
+Schoology server-renders most of itself, and the markup differs per screen and
+per district. Bespoke selectors for each page would be guesswork that breaks on
+the next template change. `page` strips scripts and navigation and prints what
+the page actually says, so it works on screens this tool has never seen. The
+trade is that a little interface furniture ("All Materials", notification
+settings) comes through with it.
 
 ### Reading the output
 
@@ -92,6 +115,10 @@ this will break. That's the trade for not having an API key.
 ## Privacy
 
 - `sgy` is **read-only**. It never writes to your Schoology account.
+- It holds a **full session**, not a scoped key, so it can reach anything your
+  account can reach — that's what makes `sgy page` work. It cannot reach
+  anything you can't: no other students' grades, no teacher gradebooks, no
+  district records.
 - Your session lives in `~/.config/schoology-cli/state.json`, mode `600`. Anyone
   who gets that file is logged in as you. Don't commit it or paste it anywhere.
 - Nothing is sent anywhere except your own school's Schoology server. There is no
