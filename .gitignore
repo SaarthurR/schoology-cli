@@ -1,0 +1,6 @@
+# Never commit a session. Anyone holding it is logged in as you.
+state.json
+config.json
+*.session
+__pycache__/
+.venv/
