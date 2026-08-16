@@ -1,0 +1,328 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""sgy — read your own Schoology grades, classes and due dates from the terminal.
+
+Schoology's official API needs a key most districts don't hand out, and the
+session cookie is httpOnly, so there's nothing to copy into a config file.
+Instead sgy keeps its own logged-in Chrome profile and calls the same internal
+JSON endpoints the Schoology web app calls. Read-only: it never writes to your
+account.
+
+    sgy setup [district-url]   one time, does everything
+    sgy classes                your classes, in period order
+    sgy grades [-v]            -v adds category weights and assignments
+    sgy due [days]             what's due, defaults to 14
+    sgy json                   raw data, for piping into other tools
+    sgy login                  re-run when the session expires
+
+Add --all to classes or grades to include non-graded enrolments (school hubs,
+counseling, advisory and the like).
+"""
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+HOME = Path.home() / ".config" / "schoology-cli"
+PROFILE = HOME / "chrome"       # keeps Google/SSO remembering you between logins
+STATE = HOME / "state.json"     # Schoology's session cookie is memory-only, so
+                                # Chrome never writes it to the profile on disk;
+                                # storage_state is the only way to keep it.
+CONFIG = HOME / "config.json"
+
+# Districts name sections like "GreensteinD p5 T1". Real classes carry a period
+# marker; hubs, counseling and advisory don't. Districts that don't use this
+# convention simply match nothing, and we fall back to showing everything.
+PERIOD = re.compile(r"\bp(\d)\b")
+
+# Runs inside the page, so the httpOnly session cookie rides along automatically.
+FETCH_JS = """
+async ({uid, start, end}) => {
+  const get = async (u) => {
+    const r = await fetch(u, {credentials: 'include',
+                             headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    return {status: r.status, text: await r.text()};
+  };
+  const clean = (e) => e ? e.textContent.replace(/\\s+/g, ' ').trim() : '';
+
+  const courses = JSON.parse((await get('/iapi2/site-navigation/courses')).text);
+
+  const gradesHtml = (await get('/grades/grades?id=' + uid)).text;
+  const doc = new DOMParser().parseFromString(gradesHtml, 'text/html');
+  // Screen-reader-only spans say "Course"/"Category"/"Grading Period" and would
+  // otherwise glue onto every title as "HomeworkCategory (15%)".
+  doc.querySelectorAll('.visually-hidden').forEach(e => e.remove());
+  const grades = [...doc.querySelectorAll('.gradebook-course')].map(c => ({
+    course: clean(c.querySelector('.gradebook-course-title')),
+    rows: [...c.querySelectorAll('tr.report-row')].map(r => ({
+      kind: (r.className.match(/(course|period|category|item)-row/) || [])[1] || '',
+      title: clean(r.querySelector('.title-column')),
+      grade: clean(r.querySelector('.grade-column')),
+    })),
+  }));
+
+  // The path segment is ignored by Schoology; only start/end matter.
+  const ym = new Date().toISOString().slice(0, 7);
+  const cal = JSON.parse(
+    (await get(`/calendar/${uid}/${ym}?ajax=1&start=${start}&end=${end}`)).text);
+
+  return {courses: courses.data.courses, grades, cal};
+}
+"""
+
+
+# ---------------------------------------------------------------- config
+
+def base():
+    if not CONFIG.exists():
+        sys.exit("Not set up yet. Run:  sgy setup")
+    return json.loads(CONFIG.read_text())["base"]
+
+
+def normalise(url):
+    """Accept fuhsd.schoology.com, https://fuhsd.schoology.com/home, etc."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return "https://" + url.split("://", 1)[1].split("/")[0]
+
+
+def looks_like_schoology(url):
+    """Districts on Google/Microsoft SSO redirect /login straight to the identity
+    provider, so check the landing URL as well as the body -- the word survives
+    in the redirect's state parameter even when the page itself is Google's."""
+    try:
+        req = urllib.request.Request(url + "/login",
+                                     headers={"User-Agent": "sgy"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read(60000).decode("utf-8", "ignore").lower()
+            return "schoology" in body or "schoology" in r.geturl().lower()
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- helpers
+
+def period_of(s):
+    m = PERIOD.search(s or "")
+    return int(m.group(1)) if m else None
+
+
+def strip_tags(s):
+    """Schoology double-encodes calendar titles, so unescape after stripping."""
+    return html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
+
+
+def signed_in(ctx):
+    """Ask Schoology directly. The URL lies -- /home flashes up before the
+    redirect to the identity provider, so a URL check declares victory early."""
+    try:
+        r = ctx.request.get(f"{base()}/iapi2/site-navigation/courses",
+                            headers={"X-Requested-With": "XMLHttpRequest"})
+        return r.ok and "json" in (r.headers.get("content-type") or "")
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- setup
+
+def ensure_browser():
+    """Playwright ships no browser by default; fetch Chromium once."""
+    marker = Path.home() / ".cache" / "ms-playwright"
+    if marker.exists() and any(marker.glob("chromium*")):
+        return
+    print("Downloading Chromium (one time, ~150MB)...")
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                   check=True)
+
+
+def link_onto_path():
+    """Put `sgy` on PATH so it works from any directory."""
+    target = Path(__file__).resolve()
+    bindir = Path.home() / ".local" / "bin"
+    if not bindir.is_dir():
+        return None
+    if str(bindir) not in os.environ.get("PATH", "").split(":"):
+        return None
+    link = bindir / "sgy"
+    if link.exists() and link.resolve() == target:
+        return link
+    try:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+        return link
+    except OSError:
+        return None
+
+
+def setup(argv):
+    HOME.mkdir(parents=True, exist_ok=True)
+
+    given = next((a for a in argv if not a.startswith("-")), None)
+    while True:
+        url = given or input(
+            "Your school's Schoology address (e.g. fuhsd.schoology.com): ")
+        given = None
+        if not url.strip():
+            continue
+        url = normalise(url)
+        print(f"Checking {url} ...")
+        if looks_like_schoology(url):
+            break
+        print(f"  {url} doesn't look like a Schoology site. Try again.\n")
+
+    CONFIG.write_text(json.dumps({"base": url}, indent=2))
+    print(f"Saved {url}")
+
+    ensure_browser()
+
+    link = link_onto_path()
+    print(f"Linked {link} -> you can run `sgy` from anywhere."
+          if link else "Note: ~/.local/bin isn't on PATH, so run ./sgy from here.")
+
+    print()
+    if login() != 0:
+        return 1
+    print("\nDone. Try:  sgy classes")
+    return 0
+
+
+def login():
+    HOME.mkdir(parents=True, exist_ok=True)
+    PROFILE.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(str(PROFILE), headless=False)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(f"{base()}/home", wait_until="domcontentloaded")
+        print("Sign in to Schoology in the window that just opened.")
+        print("Waiting... (Ctrl-C to give up)")
+        for _ in range(300):  # 10 minutes, checked every 2s
+            if signed_in(ctx):
+                ctx.storage_state(path=str(STATE))
+                STATE.chmod(0o600)
+                print("Signed in. Session saved.")
+                ctx.close()
+                return 0
+            time.sleep(2)
+        print("Timed out -- nothing saved.", file=sys.stderr)
+        ctx.close()
+        return 1
+
+
+# ---------------------------------------------------------------- fetching
+
+def load(days=30):
+    if not CONFIG.exists():
+        sys.exit("Not set up yet. Run:  sgy setup")
+    if not STATE.exists():
+        sys.exit("Not logged in yet. Run:  sgy login")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(storage_state=str(STATE))
+        page = ctx.new_page()
+        try:
+            if not signed_in(ctx):
+                sys.exit("Session expired. Run:  sgy login")
+            page.goto(f"{base()}/home", wait_until="domcontentloaded")
+            m = re.search(r'["\']uid["\']\s*:\s*["\']?(\d{6,})', page.content())
+            if not m:
+                sys.exit("Session expired. Run:  sgy login")
+            now = int(time.time())
+            return page.evaluate(FETCH_JS, {"uid": m.group(1),
+                                            "start": now,
+                                            "end": now + days * 86400})
+        finally:
+            ctx.close()
+            browser.close()
+
+
+def graded_only(items, key, show_all):
+    """Keep the real classes, in period order. If a district doesn't use period
+    markers nothing would match, so fall back to returning everything."""
+    if show_all:
+        return items
+    picked = [i for i in items if period_of(key(i)) is not None]
+    if not picked:
+        return items
+    return sorted(picked, key=lambda i: period_of(key(i)))
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_classes(show_all):
+    courses = graded_only(load()["courses"], lambda c: c["sectionTitle"], show_all)
+    for c in courses:
+        p = period_of(c["sectionTitle"])
+        print(f"{('p%d' % p) if p else '  ':<4} "
+              f"{c['courseTitle']:<32} {c['sectionTitle']}")
+
+
+def cmd_grades(verbose, show_all):
+    any_grade = False
+    for g in graded_only(load()["grades"], lambda c: c["course"], show_all):
+        rows = g["rows"]
+        overall = next((r["grade"] for r in rows if r["kind"] == "course"), "—")
+        if overall not in ("—", ""):
+            any_grade = True
+        print(f"\n{g['course']}   {overall}")
+        if not verbose:
+            continue
+        # Schoology appends an empty "(no grading period)" bucket worth 0%.
+        # Everything under it repeats the real term, so skip that whole section.
+        skipping = False
+        for r in rows:
+            if r["kind"] == "period":
+                skipping = "no grading period" in r["title"].lower()
+            elif not skipping and r["kind"] in ("category", "item"):
+                indent = "    " if r["kind"] == "category" else "      "
+                print(f"{indent}{r['title'][:58]:<58} {r['grade']}")
+    if not any_grade:
+        print("\n(no grades posted yet)")
+
+
+def cmd_due(days):
+    events = sorted(load(days)["cal"], key=lambda e: e.get("start", ""))
+    if not events:
+        print(f"Nothing due in the next {days} days.")
+        return
+    for e in events:
+        print(f"{(e.get('start') or '')[:16]}  "
+              f"{strip_tags(e.get('titleText'))[:52]:<52} "
+              f"{e.get('content_title', '')[:30]}")
+
+
+def main(argv):
+    cmd = argv[0] if argv else "grades"
+    show_all = "--all" in argv
+    if cmd == "setup":
+        return setup(argv[1:])
+    if cmd == "login":
+        return login()
+    if cmd == "classes":
+        cmd_classes(show_all)
+    elif cmd == "grades":
+        cmd_grades(verbose="-v" in argv, show_all=show_all)
+    elif cmd == "due":
+        nums = [a for a in argv[1:] if a.isdigit()]
+        cmd_due(int(nums[0]) if nums else 14)
+    elif cmd == "json":
+        print(json.dumps(load(), indent=2))
+    else:
+        sys.exit(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
