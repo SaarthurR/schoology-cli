@@ -90,6 +90,44 @@ async ({uid, start, end}) => {
 }
 """
 
+# Materials folders render their contents client-side, so the plain READ_JS
+# text scrape sees folder names with nothing under them. This walks the real
+# tree: the top page lists folder ids (`?f=<id>` links), then each folder page
+# is fetched the same way to read its files/assignments.
+MATERIALS_JS = """
+async ({nid}) => {
+  const get = async (u) => {
+    const r = await fetch(u, {credentials: 'include',
+                             headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    return await r.text();
+  };
+  const parse = (html) => new DOMParser().parseFromString(html, 'text/html');
+  const path = `/course/${nid}/materials`;
+
+  // A file's real title sits in .item-title for assignments/pages, or in
+  // .attachments-file-name for plain uploaded documents -- .item-title is
+  // present-but-empty on those, so it has to be the fallback, not first try.
+  const readItems = (doc) => [...doc.querySelectorAll('tr.dr')].map(tr => {
+    const type = (tr.className.match(/type-(\\w+)/) || [])[1] || '';
+    const a = tr.querySelector('.item-title a') || tr.querySelector('.attachments-file-name a');
+    return a ? {type, title: a.textContent.trim(), href: a.getAttribute('href')} : null;
+  }).filter(Boolean);
+
+  const topDoc = parse(await get(path));
+  const folders = [...topDoc.querySelectorAll('tr.material-row-folder')].map(tr => {
+    const a = tr.querySelector('.folder-title a');
+    return {id: tr.id.replace('f-', ''), title: a ? a.textContent.trim() : '(untitled)'};
+  });
+
+  const tree = [];
+  for (const f of folders) {
+    const fDoc = parse(await get(`${path}?f=${f.id}`));
+    tree.push({...f, items: readItems(fDoc)});
+  }
+  return {topItems: readItems(topDoc), folders: tree};
+}
+"""
+
 # Reads any page as text. No per-screen selectors, so nothing to break when
 # Schoology reshuffles a template.
 READ_JS = """
@@ -403,8 +441,18 @@ def show(path, page=None):
         print(r["text"] or "(page is empty)")
 
 
+def print_items(items, indent):
+    for it in items:
+        # /assignment/<id> and page items are readable text via `sgy page`;
+        # documents open a viewer at /course/<nid>/materials/gp/<id> -- not
+        # the file itself, see README for pulling the real attachment out.
+        print(f"{indent}[{it['type']:<10}] {it['title'][:70]:<70} {it['href']}")
+
+
 def cmd_materials(query):
-    """Resolve a class by period number or name, then print its materials."""
+    """Resolve a class by period number or name, then print its full
+    materials tree -- every folder, walked, with the files/assignments
+    inside each one. Not just the folder names."""
     with session() as (page, uid):
         now = int(time.time())
         courses = page.evaluate(FETCH_JS, {"uid": uid, "start": now,
@@ -423,7 +471,15 @@ def cmd_materials(query):
             sys.exit(f"No class matching {query!r}. Run `sgy materials` to list them.")
         for c in hits:
             print(f"=== {c['courseTitle']} ===")
-            show(f"/course/{c['nid']}/materials", page)
+            tree = page.evaluate(MATERIALS_JS, {"nid": c["nid"]})
+            if tree["topItems"]:
+                print_items(tree["topItems"], "  ")
+            for f in tree["folders"]:
+                print(f"\n  {f['title']}/")
+                if f["items"]:
+                    print_items(f["items"], "    ")
+                else:
+                    print("    (empty)")
 
 
 def main(argv):
