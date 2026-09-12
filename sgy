@@ -20,14 +20,18 @@ account.
 
 Anything else you can see in a browser:
 
-    sgy messages               your inbox
-    sgy feed                   the home feed / recent updates
+    sgy updates [class]        teachers' posts from each class's Updates section
+    sgy notifications          the bell: new materials, grades posted, replies
+    sgy messages               your inbox, with the full text of recent messages
+    sgy feed                   the home feed (Recent Activity)
     sgy info                   your profile
     sgy materials [class]      a course's materials; no arg lists your classes
     sgy page <path>            ANY Schoology page, as readable text
+    sgy detail <path>          an assignment/page description and its resource links
 
 Add --all to classes or grades to include non-graded enrolments (school hubs,
-counseling, advisory and the like).
+counseling, advisory and the like). Add --json to updates, notifications,
+messages or feed for raw data, and --updates to json to include all three.
 """
 import html
 import json
@@ -35,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -152,6 +157,157 @@ async (path) => {
 }
 """
 
+DETAIL_JS = """
+async (path) => {
+  const r = await fetch(path, {credentials: 'include',
+                               headers: {'X-Requested-With': 'XMLHttpRequest'}});
+  const body = await r.text();
+  const doc = new DOMParser().parseFromString(body, 'text/html');
+  doc.querySelectorAll('script,style,noscript,nav,header,footer,.visually-hidden,' +
+    '#header,#footer,#left-nav,.sidebar').forEach(e => e.remove());
+  const main = doc.querySelector('#main-inner,#center-top,#content,#main,body');
+  const descriptionNode = doc.querySelector(
+    '.assignment-description,.assignment-instructions,.info-body,.s-rte,' +
+    '[data-testid="assignment-description"],#assignment-description'
+  );
+  const text = (main ? main.innerText || main.textContent : '')
+    .replace(/[ \\t]+/g, ' ').replace(/ *\\n */g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  const description = ((descriptionNode ? descriptionNode.innerText || descriptionNode.textContent : text) || '')
+    .replace(/[ \\t]+/g, ' ').replace(/ *\\n */g, '\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  const resources = main ? [...main.querySelectorAll('a[href]')]
+    .map(a => ({title: a.textContent.replace(/\\s+/g, ' ').trim(), href: a.getAttribute('href')}))
+    .filter(a => a.title && a.href && !a.href.startsWith('#') && !a.href.startsWith('javascript:'))
+    .filter((a, index, all) => all.findIndex(candidate => candidate.href === a.href) === index)
+    .slice(0, 12) : [];
+  const statusText = text.toLowerCase();
+  const submittedNode = doc.querySelector(
+    '.submitted,.submission-status,.status-submitted,[data-submission-status="submitted"]'
+  );
+  const submitted = Boolean(submittedNode) ||
+    (/(submitted|turned in)/.test(statusText) && !/(not submitted|not turned in|unsubmitted|missing)/.test(statusText));
+  return {status: r.status, title: doc.title || '', description, resources, submitted};
+}
+"""
+
+STATUS_JS = """
+async (paths) => {
+  const results = [];
+  for (const path of paths) {
+    try {
+      const r = await fetch(path, {credentials: 'include', headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const body = await r.text();
+      const doc = new DOMParser().parseFromString(body, 'text/html');
+      const main = doc.querySelector('#main-inner,#center-top,#content,#main,body');
+      const text = (main ? main.innerText || main.textContent : '').toLowerCase();
+      const submittedNode = doc.querySelector('.submitted,.submission-status,.status-submitted,[data-submission-status="submitted"]');
+      const submitted = Boolean(submittedNode) ||
+        (/(submitted|turned in)/.test(text) && !/(not submitted|not turned in|unsubmitted|missing)/.test(text));
+      results.push({path, submitted});
+    } catch (_) { results.push({path, submitted: false}); }
+  }
+  return results;
+}
+"""
+
+# Class updates, the bell and the inbox. Every item carries `source`, so a class
+# post never reads as a direct message. The home page draws its posts with
+# JavaScript after load, so posts come from the /feed endpoints (JSON wrapping
+# HTML) -- reading /home itself returns an empty shell.
+INBOX_JS = """
+async ({kinds, courses}) => {
+  const get = async (u) => {
+    // Many requests in a row trip Schoology's rate limit (429); wait and retry.
+    for (let i = 0; i < 3; i++) {
+      const r = await fetch(u, {credentials: 'include',
+                                headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      if (r.status !== 429) return r.ok ? r.text() : '';
+      await new Promise(res => setTimeout(res, 1500 * (i + 1)));
+    }
+    return '';
+  };
+  const parse = (h) => new DOMParser().parseFromString(h, 'text/html');
+  const text = (e) => e ? e.textContent.replace(/\\s+/g, ' ').trim() : '';
+  // Like text(), but keeps paragraph breaks so a post's first line can serve as its title.
+  const lines = (e) => {
+    if (!e) return '';
+    e.querySelectorAll('br').forEach(b => b.replaceWith('\\n'));
+    e.querySelectorAll('p,li').forEach(b => b.append('\\n'));
+    return e.textContent.replace(/[ \\t\\u00a0]+/g, ' ').replace(/ *\\n\\s*/g, '\\n').trim();
+  };
+  const when = (s) => { const d = new Date(String(s).replace(' at ', ' '));
+                        return isNaN(d) ? '' : d.toISOString(); };
+  const feedDoc = async (u) => {
+    try { return parse(JSON.parse(await get(u)).output || ''); } catch { return parse(''); }
+  };
+  const posts = (doc, fallback) => [...doc.querySelectorAll('li[id^="edge-assoc-"]')].map(li => {
+    const inner = li.querySelector('.update-sentence-inner');
+    const ts = Number(li.getAttribute('timestamp'));
+    return {source: 'update', id: li.id, author: text(li.querySelector('.long-username')),
+            course: text(inner && inner.querySelector('a[href^="/course/"],a[href^="/group/"]')) || fallback,
+            body: lines(li.querySelector('.update-body')),
+            at: ts ? new Date(ts * 1000).toISOString() : ''};
+  });
+  const out = {};
+  if (kinds.includes('feed')) out.feed = posts(await feedDoc('/home/feed?page=0'), '');
+  if (kinds.includes('updates')) {
+    out.updates = [];
+    for (const c of courses)
+      out.updates.push(...posts(await feedDoc(`/course/${c.nid}/feed?page=0`), c.courseTitle));
+  }
+  if (kinds.includes('notifications')) {
+    const LABEL = {'course-materials-add': 'New material', 'grade-add': 'Grade posted',
+                   'comment-add': 'Reply'};
+    out.notifications = [];
+    let day = '';  // "Friday, September 11, 2026" -- the rows only say "Sep 11 at 2:56 pm"
+    for (const li of parse(await get('/home/notifications'))
+                       .querySelectorAll('ul.s-notifications-mini > li')) {
+      if (li.classList.contains('notif-date-header')) { day = text(li); continue; }
+      const sentence = li.querySelector('.edge-sentence');
+      if (!sentence) continue;
+      const type = (li.querySelector('[class*="s-edge-type-"]')?.className || '')
+                     .match(/s-edge-type-([\\w-]+)/);
+      const time = text(sentence.querySelector('.edge-time')).replace(/^.* at /, '');
+      sentence.querySelectorAll('.edge-time,.visually-hidden').forEach(e => e.remove());
+      out.notifications.push({source: 'notification',
+        type: type ? (LABEL[type[1]] || type[1]) : 'Notification',
+        // Only a bare /course/<id> link is the class; /course/<id>/materials/... is the item.
+        course: text([...sentence.querySelectorAll('a[href]')]
+                       .find(a => /^\\/course\\/\\d+$/.test(a.getAttribute('href')))),
+        text: text(sentence),
+        at: when(`${day.replace(/^\\w+, /, '')} ${time}`)});
+    }
+  }
+  if (kinds.includes('messages')) {
+    out.messages = [];
+    const rows = parse(await get('/messages')).querySelectorAll('table.privatemsg-list tbody tr');
+    for (const [i, tr] of [...rows].entries()) {
+      const cell = tr.querySelector('.privatemsg-list-subject');
+      if (!cell) continue;
+      const link = cell.querySelector('.subject-link');
+      const href = link ? link.getAttribute('href') : '';
+      const subject = cell.getAttribute('subject') || text(link);
+      let body = text(cell.querySelector('.privatemsg-list-body'));
+      // The list only shows a cut-off preview; the newest few get one more request.
+      if (href && i < 8) {
+        const m = parse(await get(href)).querySelector('.message-body');
+        if (m) { m.querySelector('.name')?.remove(); body = lines(m) || body; }
+      }
+      out.messages.push({source: 'message', id: href, subject, body,
+        course: (subject.match(/^\\[([^\\]]+)\\]/) || [])[1] || '',
+        author: text(tr.querySelector('.names-date a')),
+        unread: tr.className.includes('unread'),
+        at: when(text(tr.querySelector('.names-date .small')))});
+    }
+  }
+  return out;
+}
+"""
+
+COURSES_JS = """
+async () => (await (await fetch('/iapi2/site-navigation/courses', {credentials: 'include',
+  headers: {'X-Requested-With': 'XMLHttpRequest'}})).json()).data.courses
+"""
+
 
 # ---------------------------------------------------------------- config
 
@@ -193,6 +349,19 @@ def period_of(s):
 def strip_tags(s):
     """Schoology double-encodes calendar titles, so unescape after stripping."""
     return html.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
+
+
+def clean_course(name):
+    """'Biology - 3110: HajjarianP p1 T1' -> 'Biology'."""
+    return re.sub(r"\s+-\s+\d{3,}\b.*$", "", name or "").strip()
+
+
+def when_local(iso):
+    if not iso:
+        return "(no date)".ljust(17)
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    return (f"{dt:%a %b} {dt.day} {dt.hour % 12 or 12}:{dt:%M}"
+            f"{'am' if dt.hour < 12 else 'pm'}").ljust(17)
 
 
 def signed_in(ctx):
@@ -322,11 +491,16 @@ def session():
             browser.close()
 
 
-def load(days=30):
+def load(days=30, updates=False):
     with session() as (page, uid):
         now = int(time.time())
-        return page.evaluate(FETCH_JS, {"uid": uid, "start": now,
+        data = page.evaluate(FETCH_JS, {"uid": uid, "start": now,
                                         "end": now + days * 86400})
+        if updates:
+            data.update(page.evaluate(INBOX_JS, {
+                "kinds": ["updates", "notifications", "messages"],
+                "courses": data["courses"]}))
+        return data
 
 
 def page_text(path, page=None):
@@ -441,6 +615,23 @@ def show(path, page=None):
         print(r["text"] or "(page is empty)")
 
 
+def detail(path):
+    """Read one trusted Schoology item as structured local data."""
+    with session() as (page, _):
+        result = page.evaluate(DETAIL_JS, path)
+    if result["status"] >= 400:
+        sys.exit(f"Schoology returned {result['status']} for {path}")
+    result["base"] = base()
+    print(json.dumps(result))
+
+
+def statuses(paths):
+    """Check several assignment submission states through one signed-in browser."""
+    with session() as (page, _):
+        result = page.evaluate(STATUS_JS, paths)
+    print(json.dumps(result))
+
+
 def print_items(items, indent):
     for it in items:
         # /assignment/<id> and page items are readable text via `sgy page`;
@@ -449,27 +640,57 @@ def print_items(items, indent):
         print(f"{indent}[{it['type']:<10}] {it['title'][:70]:<70} {it['href']}")
 
 
+def pick_courses(courses, query):
+    """A class by period number or part of its name; every enrolment if no query."""
+    if not query:
+        return courses
+    q = query.lower()
+    hits = [c for c in courses
+            if q in c["courseTitle"].lower()
+            or (q.isdigit() and period_of(c["sectionTitle"]) == int(q))]
+    if not hits:
+        sys.exit(f"No class matching {query!r}. Run `sgy classes` to list them.")
+    return hits
+
+
+def cmd_inbox(kind, query, as_json):
+    with session() as (page, _):
+        courses = pick_courses(page.evaluate(COURSES_JS), query) if kind == "updates" else []
+        items = page.evaluate(INBOX_JS, {"kinds": [kind], "courses": courses})[kind]
+    if as_json:
+        print(json.dumps(items, indent=2))
+        return
+    if not items:
+        print("(nothing here)")
+    # Newest first. The bracket says which Schoology box it came from.
+    for it in sorted(items, key=lambda i: i.get("at") or "", reverse=True):
+        label = {"update": "Update", "message": "Message"}.get(it["source"]) or it.get("type")
+        who = " · ".join(x for x in (clean_course(it.get("course")), it.get("author")) if x)
+        body = it.get("body") or it.get("text", "").replace(it.get("course") or "\0",
+                                                            clean_course(it.get("course")))
+        if len(body) > 400:
+            body = body[:400] + "…"
+        print(f"{when_local(it.get('at'))} [{label}] {who}")
+        if it.get("subject"):
+            print(f"    {it['subject']}")
+        for para in body.split("\n"):
+            print(textwrap.fill(para, 96, initial_indent="    ", subsequent_indent="    "))
+        print()
+
+
 def cmd_materials(query):
     """Resolve a class by period number or name, then print its full
     materials tree -- every folder, walked, with the files/assignments
     inside each one. Not just the folder names."""
     with session() as (page, uid):
-        now = int(time.time())
-        courses = page.evaluate(FETCH_JS, {"uid": uid, "start": now,
-                                           "end": now})["courses"]
+        courses = page.evaluate(COURSES_JS)
         if not query:
             print("Which class? Pass a period number or part of the name:\n")
             for c in courses:
                 p = period_of(c["sectionTitle"])
                 print(f"  {('p%d' % p) if p else '  ':<4} {c['courseTitle']}")
             return
-        q = query.lower()
-        hits = [c for c in courses
-                if q in c["courseTitle"].lower()
-                or (q.isdigit() and period_of(c["sectionTitle"]) == int(q))]
-        if not hits:
-            sys.exit(f"No class matching {query!r}. Run `sgy materials` to list them.")
-        for c in hits:
+        for c in pick_courses(courses, query):
             print(f"=== {c['courseTitle']} ===")
             tree = page.evaluate(MATERIALS_JS, {"nid": c["nid"]})
             if tree["topItems"]:
@@ -498,11 +719,9 @@ def main(argv):
         nums = [a for a in argv[1:] if a.isdigit()]
         cmd_due(int(nums[0]) if nums else 14)
     elif cmd == "json":
-        print(json.dumps(load(), indent=2))
-    elif cmd == "messages":
-        show("/messages")
-    elif cmd == "feed":
-        show("/home")
+        print(json.dumps(load(updates="--updates" in argv), indent=2))
+    elif cmd in ("updates", "notifications", "messages", "feed"):
+        cmd_inbox(cmd, rest[0] if rest else None, "--json" in argv)
     elif cmd == "info":
         with session() as (page, uid):
             show(f"/user/{uid}/info", page)
@@ -512,6 +731,14 @@ def main(argv):
         if not rest:
             sys.exit("Which page? e.g.  sgy page /messages/sent")
         show(rest[0] if rest[0].startswith("/") else "/" + rest[0])
+    elif cmd == "detail":
+        if not rest:
+            sys.exit("Which item? e.g.  sgy detail /assignment/12345")
+        detail(rest[0] if rest[0].startswith("/") else "/" + rest[0])
+    elif cmd == "statuses":
+        if not rest:
+            sys.exit("Which items? e.g.  sgy statuses /assignment/123 /assignment/456")
+        statuses([item if item.startswith("/") else "/" + item for item in rest])
     else:
         sys.exit(__doc__)
     return 0
